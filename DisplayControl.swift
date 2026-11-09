@@ -29,6 +29,13 @@ func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: Un
 @_silgen_name("DisplayServicesSetBrightness")
 func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int32
 
+
+@_silgen_name("DisplayServicesRegisterForBrightnessChangeNotifications")
+func DisplayServicesRegisterForBrightnessChangeNotifications(
+    _ display: CGDirectDisplayID,
+    _ observer: UnsafeRawPointer?,
+    _ callback: @convention(c) (CFNotificationCenter?, UnsafeMutableRawPointer?, CFString?, UnsafeRawPointer?, CFDictionary?) -> Void
+) -> Int32
 @_silgen_name("CoreDisplay_DisplayCreateInfoDictionary")
 func CoreDisplay_DisplayCreateInfoDictionary(_ display: CGDirectDisplayID) -> Unmanaged<CFDictionary>?
 
@@ -638,6 +645,8 @@ final class DisplayManager: ObservableObject {
     private var saveWorkItem: DispatchWorkItem?
     private var disabledDisplaysByUUID: [String: DisplayInfo] = [:]
     private var customLUTDisplayIDs: Set<CGDirectDisplayID> = []
+    private var registeredBrightnessNotificationIDs: Set<CGDirectDisplayID> = []
+    private var lastBuiltinBrightnessWriteTime: CFAbsoluteTime = 0
 
     private init() {
         CGDisplayRestoreColorSyncSettings()
@@ -782,6 +791,7 @@ final class DisplayManager: ObservableObject {
                 adjustmentsByUUID[uuid] = ImageAdjustments()
             }
             if isBuiltin && isEnabled {
+                registerBrightnessNotificationIfNeeded(for: did)
                 var hwB: Float = 0.5
                 if DisplayServicesGetBrightness(did, &hwB) == 0 && hwB > 0.02 {
                     adjustmentsByUUID[uuid]?.combinedBrightness = Double(hwB)
@@ -812,11 +822,26 @@ final class DisplayManager: ObservableObject {
         draggingSliderIndex = nil
     }
 
+    private func registerBrightnessNotificationIfNeeded(for displayID: CGDirectDisplayID) {
+        guard !registeredBrightnessNotificationIDs.contains(displayID) else { return }
+        registeredBrightnessNotificationIDs.insert(displayID)
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        _ = DisplayServicesRegisterForBrightnessChangeNotifications(displayID, observer) { _, _, _, _, _ in
+            DispatchQueue.main.async {
+                guard CFAbsoluteTimeGetCurrent() - DisplayManager.shared.lastBuiltinBrightnessWriteTime > 0.15 else { return }
+                DisplayManager.shared.syncBuiltinBrightness()
+            }
+        }
+    }
+
     func syncBuiltinBrightness() {
         for disp in displays where disp.isBuiltin && disp.isEnabled {
             var hwB: Float = 0.5
             if DisplayServicesGetBrightness(disp.id, &hwB) == 0 && hwB > 0.02 {
-                adjustmentsByUUID[disp.uuid]?.combinedBrightness = Double(hwB)
+                let target = Double(hwB) >= 0.995 ? 1.0 : Double(hwB)
+                if abs((adjustmentsByUUID[disp.uuid]?.combinedBrightness ?? 0) - target) > 0.002 {
+                    adjustmentsByUUID[disp.uuid]?.combinedBrightness = target
+                }
             }
         }
     }
@@ -1173,6 +1198,7 @@ final class DisplayManager: ObservableObject {
         saveAdjustments()
 
         if disp.isBuiltin {
+            lastBuiltinBrightnessWriteTime = CFAbsoluteTimeGetCurrent()
             _ = DisplayServicesSetBrightness(disp.id, Float(clamped))
         } else {
             let ddcVal = UInt16(round(clamped * 100.0))
@@ -1596,6 +1622,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             default: DisplayManager.shared.activeSubmenu = .none
             }
         }
+        if let selIdx = args.firstIndex(of: "--select-display"), selIdx + 1 < args.count {
+            let target = args[selIdx + 1].lowercased()
+            if let match = DisplayManager.shared.displays.first(where: {
+                (target == "builtin" && $0.isBuiltin) ||
+                (target == "external" && !$0.isBuiltin) ||
+                $0.uuid.lowercased() == target ||
+                String($0.id) == target
+            }) {
+                DisplayManager.shared.selectedDisplayUUID = match.uuid
+            }
+        }
         if args.contains("--manage-favorites") {
             DisplayManager.shared.isManagingFavorites = true
         }
@@ -1708,7 +1745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 struct DisplayControlApp {
     static func main() {
         let args = CommandLine.arguments
-        if args.count > 1 && args[1].hasPrefix("--") && args[1] != "--background" && args[1] != "--submenu" && args[1] != "--manage-favorites" {
+        if args.count > 1 && args[1].hasPrefix("--") && args[1] != "--background" && args[1] != "--submenu" && args[1] != "--manage-favorites" && args[1] != "--select-display" {
             runCLI(args: Array(args.dropFirst()))
             DisplayManager.shared.flushSavedAdjustments()
             exit(0)
