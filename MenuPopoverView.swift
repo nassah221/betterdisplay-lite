@@ -82,7 +82,6 @@ struct MenuPopoverView: View {
         .frame(width: PopoverLayoutMetrics.width, height: h, alignment: .top)
         .background(Color(red: 0.11, green: 0.12, blue: 0.15))
         .onAppear {
-            manager.refreshDisplays()
             AppDelegate.shared?.updatePopoverSize(width: PopoverLayoutMetrics.width, height: targetPopoverHeight)
         }
         .onChange(of: manager.activeSubmenu) { _, _ in
@@ -224,7 +223,13 @@ struct MenuPopoverView: View {
                 expandedBodyHeight: expandedBodyHeight(for: .displayMode),
                 onToggle: { toggleSubmenu(.displayMode) }
             ) {
-                DisplayModeSubpanel(disp: disp)
+                DisplayModeSubpanel(
+                    disp: disp,
+                    favoriteIDs: manager.favoriteModeIDsByUUID[disp.uuid] ?? [],
+                    showAllModes: manager.showAllModesInSubpanel,
+                    isManagingFavorites: manager.isManagingFavorites
+                )
+                .equatable()
             }
 
             CCExpandableSection(

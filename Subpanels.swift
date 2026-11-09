@@ -1,17 +1,31 @@
 import SwiftUI
 
-struct DisplayModeSubpanel: View {
-    @ObservedObject var manager = DisplayManager.shared
+struct DisplayModeSubpanel: View, Equatable {
     let disp: DisplayInfo
+    let favoriteIDs: [String]
+    let showAllModes: Bool
+    let isManagingFavorites: Bool
+
+    static func == (lhs: DisplayModeSubpanel, rhs: DisplayModeSubpanel) -> Bool {
+        lhs.disp.id == rhs.disp.id &&
+        lhs.disp.currentWidth == rhs.disp.currentWidth &&
+        lhs.disp.currentHeight == rhs.disp.currentHeight &&
+        lhs.disp.isCurrentHiDPI == rhs.disp.isCurrentHiDPI &&
+        lhs.disp.currentRefreshRate == rhs.disp.currentRefreshRate &&
+        lhs.disp.modes.count == rhs.disp.modes.count &&
+        lhs.favoriteIDs == rhs.favoriteIDs &&
+        lhs.showAllModes == rhs.showAllModes &&
+        lhs.isManagingFavorites == rhs.isManagingFavorites
+    }
 
     private var favoriteModes: [DisplayModeItem] {
-        let favIDs = Set(manager.favoriteModeIDsByUUID[disp.uuid] ?? [])
-        return disp.modes.filter { favIDs.contains($0.id) }
+        let favSet = Set(favoriteIDs)
+        return disp.modes.filter { favSet.contains($0.id) }
     }
     private var nativeModes: [DisplayModeItem] { disp.modes.filter(\.isNative) }
     private var filteredModes: [DisplayModeItem] {
         let modes = disp.modes.filter { !$0.isNative }
-        guard !manager.showAllModesInSubpanel, let native = nativeModes.first else { return modes }
+        guard !showAllModes, let native = nativeModes.first else { return modes }
         let natRatio = Double(native.width) / Double(max(native.height, 1))
         return modes.filter { abs(Double($0.width) / Double(max($0.height, 1)) - natRatio) < 0.02 }
     }
@@ -26,19 +40,19 @@ struct DisplayModeSubpanel: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
-                        manager.isManagingFavorites.toggle()
+                        DisplayManager.shared.isManagingFavorites.toggle()
                     } label: {
                         HStack(spacing: 3) {
-                            Image(systemName: manager.isManagingFavorites ? "checkmark.circle.fill" : "star.circle")
+                            Image(systemName: isManagingFavorites ? "checkmark.circle.fill" : "star.circle")
                                 .font(.system(size: 10, weight: .regular))
-                            Text(manager.isManagingFavorites ? "Done" : "Manage…")
+                            Text(isManagingFavorites ? "Done" : "Manage…")
                                 .font(.system(size: 10, weight: .regular))
                         }
-                        .foregroundColor(manager.isManagingFavorites ? .white : Color.white.opacity(0.85))
+                        .foregroundColor(isManagingFavorites ? .white : Color.white.opacity(0.85))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 2)
                         .background(
-                            Capsule().fill(manager.isManagingFavorites ? Color(red: 0.04, green: 0.52, blue: 1.0) : Color(red: 0.22, green: 0.23, blue: 0.27))
+                            Capsule().fill(isManagingFavorites ? Color(red: 0.04, green: 0.52, blue: 1.0) : Color(red: 0.22, green: 0.23, blue: 0.27))
                         )
                     }
                     .buttonStyle(.plain)
@@ -60,8 +74,8 @@ struct DisplayModeSubpanel: View {
                 HStack(spacing: 4) {
                     Text("Modes matching default filter:").font(.system(size: 10.5, weight: .regular)).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Filter: \(manager.showAllModesInSubpanel ? "All" : "Aspect")") {
-                        manager.showAllModesInSubpanel.toggle()
+                    Button("Filter: \(showAllModes ? "All" : "Aspect")") {
+                        DisplayManager.shared.showAllModesInSubpanel.toggle()
                     }
                     .font(.system(size: 10, weight: .regular)).buttonStyle(.plain)
                     .padding(.horizontal, 7).padding(.vertical, 2)
@@ -77,17 +91,17 @@ struct DisplayModeSubpanel: View {
 
     private func modeRow(_ item: DisplayModeItem) -> some View {
         let isCurrent = (item.width == disp.currentWidth && item.height == disp.currentHeight && item.isHiDPI == disp.isCurrentHiDPI && item.refreshRate == disp.currentRefreshRate)
-        let isFav = manager.isFavoriteMode(item, for: disp)
+        let isFav = favoriteIDs.contains(item.id)
         return Button {
-            if manager.isManagingFavorites {
-                manager.toggleFavoriteMode(item, for: disp)
+            if isManagingFavorites {
+                DisplayManager.shared.toggleFavoriteMode(item, for: disp)
             } else {
-                manager.setDisplayMode(item, for: disp)
+                DisplayManager.shared.setDisplayMode(item, for: disp)
             }
         } label: {
             HStack(spacing: 5) {
                 Group {
-                    if manager.isManagingFavorites {
+                    if isManagingFavorites {
                         Image(systemName: isFav ? "star.circle.fill" : "plus.circle")
                             .foregroundStyle(isFav ? Color.yellow : .secondary)
                     } else if isCurrent {

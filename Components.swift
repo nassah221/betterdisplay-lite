@@ -140,7 +140,15 @@ struct CCSlider: View {
                     NativeLiquidGlassSlider(
                         value: $value,
                         range: range,
-                        onEditingChanged: onEditingChanged
+                        onEditingChanged: { editing in
+                            if !editing && showResetButton {
+                                let snapTol = (range.upperBound - range.lowerBound) * 0.015
+                                if abs(value - neutralValue) <= snapTol && value != neutralValue {
+                                    value = neutralValue
+                                }
+                            }
+                            onEditingChanged?(editing)
+                        }
                     )
                     .frame(height: 20)
                 }

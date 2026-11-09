@@ -174,7 +174,6 @@ struct ImageAdjustments: Codable, Equatable {
     var suspended: Bool = false
 
     var isLUTNeutral: Bool {
-        abs(combinedBrightness - 1.0) < 0.005 &&
         abs(contrast) < 0.005 &&
         abs(gamma) < 0.005 &&
         abs(gain) < 0.005 &&
@@ -192,10 +191,10 @@ struct ImageAdjustments: Codable, Equatable {
 
     var needsCompositorOverlay: Bool {
         guard enableCompositorFilter && !suspended else { return false }
-        return abs(saturation) > 0.005 ||
-               abs(vibrance) > 0.005 ||
-               abs(hue) > 0.005 ||
-               sepia > 0.005
+        let satTotal = max(0.0, min(3.0, 1.0 + saturation + vibrance * 0.65))
+        return abs(satTotal - 1.0) > 0.02 ||
+               abs(hue) > 0.02 ||
+               sepia > 0.02
     }
 
     mutating func resetColors() {
@@ -260,8 +259,11 @@ struct DisplayInfo: Identifiable {
 
 final class DDCController {
     static let shared = DDCController()
-    private let queue = DispatchQueue(label: "com.displaycontrol.ddc", qos: .userInitiated)
-    private var lastWriteTime: [String: TimeInterval] = [:]
+    private let queue = DispatchQueue(label: "com.displaycontrol.ddc", qos: .utility)
+    private let lock = NSLock()
+    private var pendingWrites: [String: (vcp: VCP, value: UInt16)] = [:]
+    private var lastSentValue: [String: UInt16] = [:]
+    private var isDraining = false
 
     enum VCP: UInt8 {
         case brightness = 0x10
@@ -292,23 +294,50 @@ final class DDCController {
 
     func write(vcp: VCP, value: UInt16, throttleKey: String? = nil) {
         let key = throttleKey ?? "\(vcp.rawValue)"
-        let now = CFAbsoluteTimeGetCurrent()
-        // ponytail: 30ms throttle per VCP code prevents I2C bus saturation while dragging sliders
-        if let last = lastWriteTime[key], now - last < 0.030 {
+        lock.lock()
+        if lastSentValue[key] == value && pendingWrites[key] == nil {
+            lock.unlock()
             return
         }
-        lastWriteTime[key] = now
+        pendingWrites[key] = (vcp, value)
+        let shouldStart = !isDraining
+        if shouldStart {
+            isDraining = true
+        }
+        lock.unlock()
 
-        queue.async { [weak self] in
-            guard let av = self?.findExternalAVService() else { return }
-            let hi = UInt8((value >> 8) & 0xFF)
-            let lo = UInt8(value & 0xFF)
-            let chk: UInt8 = 0x6E ^ 0x51 ^ 0x84 ^ 0x03 ^ vcp.rawValue ^ hi ^ lo
-            var packet: [UInt8] = [0x84, 0x03, vcp.rawValue, hi, lo, chk]
-            for _ in 0..<2 {
+        if shouldStart {
+            queue.async { [weak self] in
+                self?.drainLoop()
+            }
+        }
+    }
+
+    private func drainLoop() {
+        while true {
+            lock.lock()
+            guard let (key, item) = pendingWrites.first else {
+                isDraining = false
+                lock.unlock()
+                return
+            }
+            pendingWrites.removeValue(forKey: key)
+            if lastSentValue[key] == item.value {
+                lock.unlock()
+                continue
+            }
+            lastSentValue[key] = item.value
+            lock.unlock()
+
+            if let av = findExternalAVService() {
+                let hi = UInt8((item.value >> 8) & 0xFF)
+                let lo = UInt8(item.value & 0xFF)
+                let chk: UInt8 = 0x6E ^ 0x51 ^ 0x84 ^ 0x03 ^ item.vcp.rawValue ^ hi ^ lo
+                var packet: [UInt8] = [0x84, 0x03, item.vcp.rawValue, hi, lo, chk]
                 usleep(10_000)
                 _ = IOAVServiceWriteI2C(av, 0x37, 0x51, &packet, UInt32(packet.count))
             }
+            usleep(25_000)
         }
     }
 }
@@ -434,7 +463,19 @@ final class SystemColorsController {
 
 final class CompositorOverlayManager {
     static let shared = CompositorOverlayManager()
+
+    private struct AppliedOverlayState: Equatable {
+        let frame: NSRect
+        let satMilli: Int
+        let hueMilli: Int
+        let sepiaMilli: Int
+        let hideInScreenshots: Bool
+    }
+
     private var windows: [CGDirectDisplayID: NSWindow] = [:]
+    private var appliedStates: [CGDirectDisplayID: AppliedOverlayState] = [:]
+
+    var activeOverlayCount: Int { windows.count }
 
     func updateOverlay(for displayID: CGDirectDisplayID, adjustments: ImageAdjustments) {
         guard adjustments.needsCompositorOverlay,
@@ -445,10 +486,25 @@ final class CompositorOverlayManager {
             return
         }
 
+        let satTotal = max(0.0, min(3.0, 1.0 + adjustments.saturation + adjustments.vibrance * 0.65))
+        let targetState = AppliedOverlayState(
+            frame: screen.frame,
+            satMilli: Int(round(satTotal * 1000.0)),
+            hueMilli: Int(round(adjustments.hue * 1000.0)),
+            sepiaMilli: Int(round(adjustments.sepia * 1000.0)),
+            hideInScreenshots: adjustments.hideOverlayInScreenshots
+        )
+
+        if windows[displayID] != nil, appliedStates[displayID] == targetState {
+            return
+        }
+
         let win: NSWindow
         if let existing = windows[displayID] {
             win = existing
-            win.setFrame(screen.frame, display: true)
+            if existing.frame != screen.frame {
+                existing.setFrame(screen.frame, display: true)
+            }
         } else {
             let w = NSWindow(
                 contentRect: screen.frame,
@@ -479,7 +535,10 @@ final class CompositorOverlayManager {
             win = w
         }
 
-        win.sharingType = adjustments.hideOverlayInScreenshots ? .none : .readOnly
+        let desiredSharing: NSWindow.SharingType = adjustments.hideOverlayInScreenshots ? .none : .readOnly
+        if win.sharingType != desiredSharing {
+            win.sharingType = desiredSharing
+        }
 
         guard let layer = win.contentView?.layer,
               let filterCls = NSClassFromString("CAFilter") as? NSObject.Type else { return }
@@ -491,18 +550,17 @@ final class CompositorOverlayManager {
 
         var filters: [AnyObject] = []
 
-        let satTotal = max(0.0, min(3.0, 1.0 + adjustments.saturation + adjustments.vibrance * 0.65))
-        if abs(satTotal - 1.0) > 0.005, let f = makeFilter(filterCls, createSel, "colorSaturate" as CFString) {
+        if abs(satTotal - 1.0) > 0.02, let f = makeFilter(filterCls, createSel, "colorSaturate" as CFString) {
             f.setValue(NSNumber(value: satTotal), forKey: "inputAmount")
             filters.append(f)
         }
 
-        if abs(adjustments.hue) > 0.005, let f = makeFilter(filterCls, createSel, "colorHueRotate" as CFString) {
+        if abs(adjustments.hue) > 0.02, let f = makeFilter(filterCls, createSel, "colorHueRotate" as CFString) {
             f.setValue(NSNumber(value: adjustments.hue * Double.pi), forKey: "inputAngle")
             filters.append(f)
         }
 
-        if adjustments.sepia > 0.005, let f = makeFilter(filterCls, createSel, "colorMonochrome" as CFString) {
+        if adjustments.sepia > 0.02, let f = makeFilter(filterCls, createSel, "colorMonochrome" as CFString) {
             f.setValue(NSNumber(value: adjustments.sepia), forKey: "inputAmount")
             let sepiaColor = CGColor(red: 0.44, green: 0.26, blue: 0.08, alpha: 1.0)
             f.setValue(sepiaColor, forKey: "inputColor")
@@ -510,15 +568,18 @@ final class CompositorOverlayManager {
         }
 
         layer.filters = filters
+        appliedStates[displayID] = targetState
     }
 
     func removeOverlay(for displayID: CGDirectDisplayID) {
+        appliedStates.removeValue(forKey: displayID)
         if let win = windows.removeValue(forKey: displayID) {
             win.orderOut(nil)
         }
     }
 
     func removeAll() {
+        appliedStates.removeAll()
         for (_, win) in windows {
             win.orderOut(nil)
         }
@@ -532,7 +593,11 @@ final class DisplayManager: ObservableObject {
     static let shared = DisplayManager()
 
     @Published var displays: [DisplayInfo] = []
-    @Published var selectedDisplayUUID: String = ""
+    @Published var selectedDisplayUUID: String = "" {
+        didSet {
+            syncBuiltinBrightness()
+        }
+    }
     @Published var adjustmentsByUUID: [String: ImageAdjustments] = [:]
     @Published var adjustmentTab: AdjustmentTab = .toneAndTemp
     @Published var statusMessage: String = ""
@@ -570,9 +635,12 @@ final class DisplayManager: ObservableObject {
     private let defaultsKey = "DisplayControl.AdjustmentsByUUID.v1"
     private let favoritesKey = "DisplayControl.FavoriteModesByUUID.v1"
     private var lutEnforcementTimer: Timer?
+    private var saveWorkItem: DispatchWorkItem?
     private var disabledDisplaysByUUID: [String: DisplayInfo] = [:]
+    private var customLUTDisplayIDs: Set<CGDirectDisplayID> = []
 
     private init() {
+        CGDisplayRestoreColorSyncSettings()
         loadSavedAdjustments()
         loadFavorites()
         loadFontSmoothing()
@@ -713,9 +781,9 @@ final class DisplayManager: ObservableObject {
             if adjustmentsByUUID[uuid] == nil {
                 adjustmentsByUUID[uuid] = ImageAdjustments()
             }
-            if isBuiltin {
+            if isBuiltin && isEnabled {
                 var hwB: Float = 0.5
-                if DisplayServicesGetBrightness(did, &hwB) == 0 {
+                if DisplayServicesGetBrightness(did, &hwB) == 0 && hwB > 0.02 {
                     adjustmentsByUUID[uuid]?.combinedBrightness = Double(hwB)
                 }
             }
@@ -742,6 +810,15 @@ final class DisplayManager: ObservableObject {
             selectedDisplayUUID = built.first?.uuid ?? ""
         }
         draggingSliderIndex = nil
+    }
+
+    func syncBuiltinBrightness() {
+        for disp in displays where disp.isBuiltin && disp.isEnabled {
+            var hwB: Float = 0.5
+            if DisplayServicesGetBrightness(disp.id, &hwB) == 0 && hwB > 0.02 {
+                adjustmentsByUUID[disp.uuid]?.combinedBrightness = Double(hwB)
+            }
+        }
     }
 
     static func displayUUID(for displayID: CGDirectDisplayID) -> String {
@@ -1089,7 +1166,7 @@ final class DisplayManager: ObservableObject {
 
     func setCombinedBrightness(_ val: Double) {
         guard let disp = selectedDisplay else { return }
-        let clamped = max(0.05, min(1.0, val))
+        let clamped = val >= 0.995 ? 1.0 : max(0.05, min(1.0, val))
         var adj = currentAdjustments
         adj.combinedBrightness = clamped
         adjustmentsByUUID[disp.uuid] = adj
@@ -1100,40 +1177,42 @@ final class DisplayManager: ObservableObject {
         } else {
             let ddcVal = UInt16(round(clamped * 100.0))
             DDCController.shared.write(vcp: .brightness, value: ddcVal, throttleKey: "b-\(disp.uuid)")
+            applyAdjustments(for: disp, adjustments: adj)
         }
-        applyAdjustments(for: disp, adjustments: adj)
+    }
+
+    static func expectedLUT(for display: DisplayInfo, adjustments: ImageAdjustments) -> (r: [Float], g: [Float], b: [Float], isLinearIdentity: Bool) {
+        let b = max(0.05, min(1.0, adjustments.combinedBrightness))
+        let lutBrightnessScale: Double = display.isBuiltin ? 1.0 : max(0.10, 0.15 + 0.85 * b)
+        if !adjustments.enableColorTable || adjustments.suspended || (adjustments.isLUTNeutral && abs(lutBrightnessScale - 1.0) < 0.005) {
+            let linear = (0..<256).map { Float($0) / 255.0 }
+            return (linear, linear, linear, true)
+        }
+        let rTable = computeChannelLUT(channelIndex: 0, brightnessScale: lutBrightnessScale, adj: adjustments)
+        let gTable = computeChannelLUT(channelIndex: 1, brightnessScale: lutBrightnessScale, adj: adjustments)
+        let bTable = computeChannelLUT(channelIndex: 2, brightnessScale: lutBrightnessScale, adj: adjustments)
+        return (rTable, gTable, bTable, false)
     }
 
     func applyAdjustments(for display: DisplayInfo, adjustments: ImageAdjustments) {
-        let b = max(0.05, min(1.0, adjustments.combinedBrightness))
-        let lutBrightnessScale: Double
-        if display.isBuiltin {
-            lutBrightnessScale = b < 0.15 ? max(0.25, b / 0.15) : 1.0
-        } else {
-            lutBrightnessScale = max(0.10, 0.15 + 0.85 * b)
-        }
         // 2. Color Table (256-entry 1D LUT per channel via CGSetDisplayTransferByTable)
-        if !adjustments.enableColorTable || adjustments.suspended || (adjustments.isLUTNeutral && abs(lutBrightnessScale - 1.0) < 0.005) {
-            var r = (0..<256).map { Float($0) / 255.0 }
-            var g = r
-            var bl = r
-            _ = CGSetDisplayTransferByTable(display.id, 256, &r, &g, &bl)
+        let expected = Self.expectedLUT(for: display, adjustments: adjustments)
+        if expected.isLinearIdentity {
+            if customLUTDisplayIDs.remove(display.id) != nil {
+                if customLUTDisplayIDs.isEmpty {
+                    CGDisplayRestoreColorSyncSettings()
+                } else {
+                    var rTable = expected.r
+                    var gTable = expected.g
+                    var bTable = expected.b
+                    _ = CGSetDisplayTransferByTable(display.id, 256, &rTable, &gTable, &bTable)
+                }
+            }
         } else {
-            var rTable = Self.computeChannelLUT(
-                channelIndex: 0,
-                brightnessScale: lutBrightnessScale,
-                adj: adjustments
-            )
-            var gTable = Self.computeChannelLUT(
-                channelIndex: 1,
-                brightnessScale: lutBrightnessScale,
-                adj: adjustments
-            )
-            var bTable = Self.computeChannelLUT(
-                channelIndex: 2,
-                brightnessScale: lutBrightnessScale,
-                adj: adjustments
-            )
+            customLUTDisplayIDs.insert(display.id)
+            var rTable = expected.r
+            var gTable = expected.g
+            var bTable = expected.b
             _ = CGSetDisplayTransferByTable(display.id, 256, &rTable, &gTable, &bTable)
         }
 
@@ -1210,19 +1289,28 @@ final class DisplayManager: ObservableObject {
     }
 
     private func enforceLUTIfDrifted() {
-        for disp in displays where disp.isEnabled {
-            guard let adj = adjustmentsByUUID[disp.uuid],
-                  adj.enableColorTable,
-                  !adj.suspended,
-                  (!adj.isLUTNeutral || adj.combinedBrightness < 0.99) else { continue }
-
+        for disp in displays where disp.isEnabled && !disp.isBuiltin {
+            guard let adj = adjustmentsByUUID[disp.uuid] else { continue }
+            let expected = Self.expectedLUT(for: disp, adjustments: adj)
+            guard !expected.isLinearIdentity else { continue }
             var r = [Float](repeating: 0, count: 256)
             var g = [Float](repeating: 0, count: 256)
             var b = [Float](repeating: 0, count: 256)
             var count: UInt32 = 0
-            if CGGetDisplayTransferByTable(disp.id, 256, &r, &g, &b, &count) == .success {
-                // If WindowServer reset LUT back to linear identity (r[255]==1, g[255]==1, b[255]==1, r[128]≈0.502), re-apply
-                applyAdjustments(for: disp, adjustments: adj)
+            guard CGGetDisplayTransferByTable(disp.id, 256, &r, &g, &b, &count) == .success,
+                  min(Int(count), 256) > 0 else { continue }
+            let checkCount = min(Int(count), 256)
+
+            let drifted = (0..<checkCount).contains { i in
+                abs(r[i] - expected.r[i]) > 0.015 ||
+                abs(g[i] - expected.g[i]) > 0.015 ||
+                abs(b[i] - expected.b[i]) > 0.015
+            }
+            if drifted {
+                var expR = expected.r
+                var expG = expected.g
+                var expB = expected.b
+                _ = CGSetDisplayTransferByTable(disp.id, 256, &expR, &expG, &expB)
             }
         }
     }
@@ -1254,13 +1342,14 @@ final class DisplayManager: ObservableObject {
 
     func resetAllDisplays() {
         reenableAllDisplays()
+        customLUTDisplayIDs.removeAll()
         CGDisplayRestoreColorSyncSettings()
         CompositorOverlayManager.shared.removeAll()
         for disp in displays {
             adjustmentsByUUID[disp.uuid]?.resetColors()
             if disp.isBuiltin {
                 var hwB: Float = 0.5
-                if DisplayServicesGetBrightness(disp.id, &hwB) == 0 {
+                if DisplayServicesGetBrightness(disp.id, &hwB) == 0 && hwB > 0.02 {
                     adjustmentsByUUID[disp.uuid]?.combinedBrightness = Double(hwB)
                 }
             } else {
@@ -1309,10 +1398,21 @@ final class DisplayManager: ObservableObject {
 
     // MARK: - Persistence
 
-    private func saveAdjustments() {
+    func flushSavedAdjustments() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
         if let data = try? JSONEncoder().encode(adjustmentsByUUID) {
             UserDefaults.standard.set(data, forKey: defaultsKey)
         }
+    }
+
+    private func saveAdjustments() {
+        saveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushSavedAdjustments()
+        }
+        saveWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private func loadSavedAdjustments() {
@@ -1417,10 +1517,24 @@ private func displayReconfigCallback(
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class PopoverShieldView: NSView {
+    var onMouseDown: (() -> Void)?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onMouseDown?() }
+    override func rightMouseDown(with event: NSEvent) { onMouseDown?() }
+    override func otherMouseDown(with event: NSEvent) { onMouseDown?() }
+}
+
+final class PopoverShieldPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     static weak var shared: AppDelegate?
     private let popover = NSPopover()
+    private var shieldPanels: [PopoverShieldPanel] = []
     private var terminationSignals: [DispatchSourceSignal] = []
     private var resizeWorkItem: DispatchWorkItem?
 
@@ -1438,6 +1552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: PopoverLayoutMetrics.width, height: PopoverLayoutMetrics.totalHeight(for: DisplayManager.shared))
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: MenuPopoverView())
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1455,6 +1570,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     DisplayManager.shared.resetAllDisplays()
                 }
             }
+        }
+
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            guard let self, self.popover.isShown else { return }
+            self.closePopover()
+        }
+
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self, self.popover.isShown else { return event }
+            if let win = event.window, self.shieldPanels.contains(where: { $0 === win }) {
+                self.closePopover()
+                return nil
+            }
+            return event
         }
 
         let args = CommandLine.arguments
@@ -1479,7 +1608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func togglePopover(_ sender: AnyObject?) {
         if popover.isShown {
-            popover.performClose(sender)
+            closePopover()
         } else {
             showPopover()
         }
@@ -1489,8 +1618,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         DisplayManager.shared.refreshDisplays()
         popover.contentSize = NSSize(width: PopoverLayoutMetrics.width, height: PopoverLayoutMetrics.totalHeight(for: DisplayManager.shared))
+        showShieldPanels()
+        NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        popover.contentViewController?.view.window?.collectionBehavior.insert([.transient, .ignoresCycle])
+    }
+
+    func closePopover() {
+        hideShieldPanels()
+        if popover.isShown {
+            popover.close()
+        }
+    }
+
+    private func showShieldPanels() {
+        hideShieldPanels()
+        let shieldLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) - 1)
+        for screen in NSScreen.screens {
+            let panel = PopoverShieldPanel(
+                contentRect: screen.frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            panel.isOpaque = false
+            // 1/255 alpha is invisible to the eye but opaque to WindowServer hit-testing,
+            // absorbing outside clicks so clicking the desktop wallpaper never triggers macOS Reveal Desktop.
+            panel.backgroundColor = NSColor(white: 0.0, alpha: 0.004)
+            panel.hasShadow = false
+            panel.ignoresMouseEvents = false
+            panel.level = shieldLevel
+            panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle, .fullScreenAuxiliary]
+            let view = PopoverShieldView(frame: NSRect(origin: .zero, size: screen.frame.size))
+            view.onMouseDown = { [weak self] in self?.closePopover() }
+            panel.contentView = view
+            panel.orderFrontRegardless()
+            shieldPanels.append(panel)
+        }
+    }
+
+    private func hideShieldPanels() {
+        for panel in shieldPanels {
+            panel.orderOut(nil)
+        }
+        shieldPanels.removeAll()
+    }
+
+    func popoverWillClose(_ notification: Notification) {
+        hideShieldPanels()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        hideShieldPanels()
     }
 
     func updatePopoverSize(width: CGFloat, height: CGFloat) {
@@ -1511,7 +1690,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationDidResignActive(_ notification: Notification) {
+        closePopover()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        hideShieldPanels()
+        DisplayManager.shared.flushSavedAdjustments()
         DisplayManager.shared.reenableAllDisplays()
         CompositorOverlayManager.shared.removeAll()
     }
@@ -1525,6 +1710,7 @@ struct DisplayControlApp {
         let args = CommandLine.arguments
         if args.count > 1 && args[1].hasPrefix("--") && args[1] != "--background" && args[1] != "--submenu" && args[1] != "--manage-favorites" {
             runCLI(args: Array(args.dropFirst()))
+            DisplayManager.shared.flushSavedAdjustments()
             exit(0)
         }
         let app = NSApplication.shared

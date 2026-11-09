@@ -70,8 +70,9 @@ Architecture, build constraints, and hard-won macOS 26+ (`arm64-apple-macosx26.0
 ## 4. Display Hardware & Color Invariants
 
 1. **Built-in Display Brightness Safety:**
-   - Always read live system brightness via `DisplayServicesGetBrightness` inside `refreshDisplays()` for built-in displays.
+   - Always read live system brightness via `DisplayServicesGetBrightness` (ignoring transient wake-ramp values `<= 0.02`) inside `refreshDisplays()` / `syncBuiltinBrightness()` for built-in displays.
    - **Never** call `DisplayServicesSetBrightness` inside `applyAdjustments` / `applyAllAdjustments` (startup, wake, or LUT drift timer). Only call `DisplayServicesSetBrightness` inside `setCombinedBrightness(_:)` when the user actively moves the Brightness slider.
+   - **Never** scale the 1D LUT (`CGSetDisplayTransferByTable`) by `combinedBrightness` on built-in displays (`lutBrightnessScale` must always be `1.0` for `isBuiltin`), never include `combinedBrightness` in `ImageAdjustments.isLUTNeutral`, and skip built-in displays in `enforceLUTIfDrifted()` so native macOS brightness keys (F1/F2), Control Center, True Tone, and XDR headroom are never capped below 100%.
 2. **Hardware Bit-Depth Detection (`8-bit` vs. `10-bit`):**
    - SkyLight's `CGSDisplayModeDescription.bitsPerSample` reports `10` for the compositor framebuffer even on 8-bit monitors, and `IOMobileFramebufferShim.ColorElements` includes virtual 12-bit HDR elements (`IsVirtual = true`, `EOTF = 2`).
    - Always filter `IOMobileFramebufferShim`'s `ColorElements` for `IsVirtual == false && DynamicRange == 0 && EOTF == 0` (highest `Score` → `Depth`) to get the real physical link bit depth (`8-bit` on HP Z27u G3).
