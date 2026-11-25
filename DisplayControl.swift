@@ -607,7 +607,19 @@ final class DisplayManager: ObservableObject {
     }
     @Published var adjustmentsByUUID: [String: ImageAdjustments] = [:]
     @Published var adjustmentTab: AdjustmentTab = .toneAndTemp
-    @Published var statusMessage: String = ""
+    @Published var statusMessage: String = "" {
+        didSet {
+            statusClearWork?.cancel()
+            statusClearWork = nil
+            guard !statusMessage.isEmpty else { return }
+            let work = DispatchWorkItem { [weak self] in
+                withAnimation(CCMotion.collapse) { self?.statusMessage = "" }
+            }
+            statusClearWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
+        }
+    }
+    private var statusClearWork: DispatchWorkItem?
 
     // System Colors state
     @Published var isDarkMode: Bool = SLSGetAppearanceThemeLegacy()
@@ -623,6 +635,8 @@ final class DisplayManager: ObservableObject {
     @Published var launchAtLogin: Bool = false
     @Published var favoriteModeIDsByUUID: [String: [String]] = [:]
     @Published var isManagingFavorites: Bool = false
+    @Published var isPopoverPresented: Bool = false
+    @Published var popoverOriginX: CGFloat = 0.5
 
     enum ActiveSubmenu: Equatable {
         case none
@@ -1556,13 +1570,24 @@ final class PopoverShieldPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class PopoverPanel: NSPanel {
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     static weak var shared: AppDelegate?
-    private let popover = NSPopover()
+    private var panel: PopoverPanel!
     private var shieldPanels: [PopoverShieldPanel] = []
     private var terminationSignals: [DispatchSourceSignal] = []
-    private var resizeWorkItem: DispatchWorkItem?
+    private var closeWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         CGDisplayRegisterReconfigurationCallback(displayReconfigCallback, nil)
@@ -1575,11 +1600,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             terminationSignals.append(src)
         }
 
-        popover.contentSize = NSSize(width: PopoverLayoutMetrics.width, height: PopoverLayoutMetrics.totalHeight(for: DisplayManager.shared))
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: MenuPopoverView())
+        let initialHeight = PopoverLayoutMetrics.maxPanelHeight(for: DisplayManager.shared)
+        panel = PopoverPanel(
+            contentRect: NSRect(x: 0, y: 0, width: PopoverLayoutMetrics.panelWidth, height: initialHeight),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)))
+        panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle, .fullScreenAuxiliary]
+        panel.onCancel = { [weak self] in
+            self?.closePopover(animated: false)
+        }
+        let host = NSHostingController(rootView: MenuPopoverView())
+        host.sizingOptions = []   // static-height transparent panel; SwiftUI animates cardView inside
+        panel.contentViewController = host
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -1599,15 +1639,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
-            guard let self, self.popover.isShown else { return }
+            guard let self, self.panel.isVisible else { return }
             self.closePopover()
         }
 
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
-            guard let self, self.popover.isShown else { return event }
+            guard let self, self.panel.isVisible else { return event }
             if let win = event.window, self.shieldPanels.contains(where: { $0 === win }) {
                 self.closePopover()
                 return nil
+            }
+            if event.window === self.panel {
+                let cardH = PopoverLayoutMetrics.totalCardHeight(for: DisplayManager.shared)
+                let cardRect = NSRect(
+                    x: PopoverLayoutMetrics.shadowHorizontalInset,
+                    y: self.panel.frame.height - PopoverLayoutMetrics.shadowTopInset - cardH,
+                    width: PopoverLayoutMetrics.width,
+                    height: cardH
+                )
+                if !cardRect.contains(event.locationInWindow) {
+                    self.closePopover()
+                    return nil
+                }
             }
             return event
         }
@@ -1643,29 +1696,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private var lastCloseTime: TimeInterval = 0
+
     @objc func togglePopover(_ sender: AnyObject?) {
-        if popover.isShown {
+        if panel.isVisible && DisplayManager.shared.isPopoverPresented {
             closePopover()
+        } else if ProcessInfo.processInfo.systemUptime - lastCloseTime < 0.35 {
+            // The same click already dismissed the popover (via outside-click monitors); don't reopen.
+            return
         } else {
             showPopover()
         }
     }
 
-    func showPopover() {
-        guard let button = statusItem.button else { return }
-        DisplayManager.shared.refreshDisplays()
-        popover.contentSize = NSSize(width: PopoverLayoutMetrics.width, height: PopoverLayoutMetrics.totalHeight(for: DisplayManager.shared))
-        showShieldPanels()
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.collectionBehavior.insert([.transient, .ignoresCycle])
+    private func computePanelFrame() -> (NSRect, CGFloat) {
+        let cardW = PopoverLayoutMetrics.width
+        let panelW = PopoverLayoutMetrics.panelWidth
+        let panelH = PopoverLayoutMetrics.maxPanelHeight(for: DisplayManager.shared)
+
+        let button = statusItem.button
+        let buttonScreenRect: NSRect
+        if let button, let win = button.window {
+            buttonScreenRect = win.convertToScreen(button.convert(button.bounds, to: nil))
+        } else {
+            let fallbackScreen = NSScreen.main ?? NSScreen.screens.first
+            let vis = fallbackScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            buttonScreenRect = NSRect(x: vis.maxX - 180, y: vis.maxY, width: 28, height: 22)
+        }
+
+        let targetScreen = button?.window?.screen
+            ?? NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: buttonScreenRect.midX, y: buttonScreenRect.midY)) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visible = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+
+        let cardMinX = min(max(buttonScreenRect.midX - cardW * 0.5, visible.minX + 8), visible.maxX - 8 - cardW)
+        let originX = min(max((buttonScreenRect.midX - cardMinX) / cardW, 0.12), 0.88)
+        let cardTopY = visible.maxY - 6
+        let panelOriginY = cardTopY + PopoverLayoutMetrics.shadowTopInset - panelH
+        let panelOriginX = cardMinX - PopoverLayoutMetrics.shadowHorizontalInset
+        return (NSRect(x: round(panelOriginX), y: round(panelOriginY), width: panelW, height: panelH), originX)
     }
 
-    func closePopover() {
-        hideShieldPanels()
-        if popover.isShown {
-            popover.close()
+    func showPopover() {
+        closeWorkItem?.cancel()
+        closeWorkItem = nil
+        DisplayManager.shared.refreshDisplays()
+        let (frame, originX) = computePanelFrame()
+        DisplayManager.shared.popoverOriginX = originX
+        DisplayManager.shared.isPopoverPresented = false
+        panel.setFrame(frame, display: false)
+        showShieldPanels()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async {
+            withAnimation(CCMotion.popoverOpen) {
+                DisplayManager.shared.isPopoverPresented = true
+            }
         }
+    }
+
+    func refreshPanelFrame() {
+        guard panel.isVisible else { return }
+        let (frame, originX) = computePanelFrame()
+        DisplayManager.shared.popoverOriginX = originX
+        panel.setFrame(frame, display: true)
+    }
+
+    func closePopover(animated: Bool = true) {
+        if panel.isVisible && DisplayManager.shared.isPopoverPresented {
+            lastCloseTime = ProcessInfo.processInfo.systemUptime
+        }
+        closeWorkItem?.cancel()
+        closeWorkItem = nil
+        guard panel.isVisible || DisplayManager.shared.isPopoverPresented else {
+            hideShieldPanels()
+            return
+        }
+        if !animated || CCMotion.reduceMotion {
+            DisplayManager.shared.isPopoverPresented = false
+            panel.orderOut(nil)
+            hideShieldPanels()
+            return
+        }
+        withAnimation(CCMotion.popoverClose) {
+            DisplayManager.shared.isPopoverPresented = false
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !DisplayManager.shared.isPopoverPresented else { return }
+            self.panel.orderOut(nil)
+            self.hideShieldPanels()
+        }
+        closeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
     private func showShieldPanels() {
@@ -1701,34 +1824,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         shieldPanels.removeAll()
     }
 
-    func popoverWillClose(_ notification: Notification) {
-        hideShieldPanels()
-    }
-
-    func popoverDidClose(_ notification: Notification) {
-        hideShieldPanels()
-    }
-
-    func updatePopoverSize(width: CGFloat, height: CGFloat) {
-        let target = NSSize(width: width, height: height)
-        resizeWorkItem?.cancel()
-        guard abs(popover.contentSize.height - target.height) > 0.5 || abs(popover.contentSize.width - target.width) > 0.5 else {
-            return
-        }
-        if target.height >= popover.contentSize.height {
-            popover.contentSize = target
-        } else {
-            // Delay shrinking the NSPopover window until the 0.22s SwiftUI collapse animation finishes
-            let work = DispatchWorkItem { [weak self] in
-                self?.popover.contentSize = target
-            }
-            resizeWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
-        }
-    }
-
     func applicationDidResignActive(_ notification: Notification) {
-        closePopover()
+        closePopover(animated: false)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
